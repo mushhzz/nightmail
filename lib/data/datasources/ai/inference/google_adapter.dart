@@ -10,6 +10,7 @@ import '../../../../domain/entities/ai/ai_message.dart';
 import '../../../../domain/entities/ai/ai_provider.dart';
 import '../../../../domain/entities/ai/ai_request.dart';
 import '../../../../domain/entities/ai/ai_response.dart';
+import '../../../../domain/entities/ai/ai_tool_call.dart';
 import 'ai_adapter.dart';
 
 /// [AiAdapter] for providers speaking Google's native Gemini
@@ -158,6 +159,9 @@ class GoogleAdapter implements AiAdapter {
     int? completionTokens;
     String? finishReason;
     String? blockReason;
+    // Gemini delivers tool calls inline as `functionCall` content parts rather
+    // than as fragmented deltas; accumulate them for the terminal chunk.
+    final toolCalls = <AiToolCall>[];
 
     // Decode the byte stream with a single stateful `utf8.decoder` (as the
     // OpenAI/Anthropic adapters do) so multibyte code points split across
@@ -212,6 +216,29 @@ class GoogleAdapter implements AiAdapter {
           if (text.isNotEmpty) {
             yield Right(AiChunk(delta: text));
           }
+          // Detect `functionCall` parts ({name, args}) and assemble them into
+          // `AiToolCall`s. Gemini has no native call id, so synthesize a stable
+          // one from the function name + its ordinal in this round.
+          final content = candidate['content'];
+          if (content is Map && content['parts'] is List) {
+            for (final part in content['parts'] as List) {
+              if (part is Map && part['functionCall'] is Map) {
+                final fnCall = part['functionCall'] as Map;
+                final name =
+                    fnCall['name'] is String ? fnCall['name'] as String : '';
+                final args = fnCall['args'] is Map
+                    ? Map<String, dynamic>.from(fnCall['args'] as Map)
+                    : <String, dynamic>{};
+                toolCalls.add(
+                  AiToolCall(
+                    id: '$name-${toolCalls.length}',
+                    name: name,
+                    arguments: args,
+                  ),
+                );
+              }
+            }
+          }
           if (candidate['finishReason'] is String) {
             finishReason = candidate['finishReason'] as String;
           }
@@ -239,13 +266,19 @@ class GoogleAdapter implements AiAdapter {
     // gathered so the consumer always receives a `done` signal. A
     // safety-blocked prompt has no candidate finishReason; surface its
     // `blockReason` so a block isn't reported as a clean empty success.
+    // When the round ended in tool calls, surface them on the terminal chunk
+    // with the normalized `tool_calls` finishReason so the agent loop can
+    // execute them; otherwise pass through Gemini's finishReason/blockReason.
     yield Right(
       AiChunk(
         delta: '',
         done: true,
-        finishReason: finishReason ?? blockReason,
+        finishReason: toolCalls.isNotEmpty
+            ? 'tool_calls'
+            : (finishReason ?? blockReason),
         promptTokens: promptTokens,
         completionTokens: completionTokens,
+        toolCalls: toolCalls.isNotEmpty ? toolCalls : null,
       ),
     );
   }
@@ -302,11 +335,46 @@ class GoogleAdapter implements AiAdapter {
             ],
           });
         case AiRole.assistant:
-          // Gemini spells the assistant role `model`.
+          // Gemini spells the assistant role `model`. An assistant turn that
+          // requested tools encodes each call as a `functionCall` part
+          // (alongside any text the model emitted before the call).
+          final toolCalls = message.toolCalls;
+          if (toolCalls != null && toolCalls.isNotEmpty) {
+            contents.add({
+              'role': 'model',
+              'parts': [
+                if (message.content.isNotEmpty) {'text': message.content},
+                for (final call in toolCalls)
+                  {
+                    'functionCall': {
+                      'name': call.name,
+                      'args': call.arguments,
+                    },
+                  },
+              ],
+            });
+          } else {
+            contents.add({
+              'role': 'model',
+              'parts': [
+                {'text': message.content},
+              ],
+            });
+          }
+        case AiRole.tool:
+          // A tool-result turn becomes a `functionResponse` part. Gemini
+          // carries function responses on a `user`-role content (contents
+          // alternate user/model; the response is the user's reply to the
+          // model's call). `name` keys the result back to the called function.
           contents.add({
-            'role': 'model',
+            'role': 'user',
             'parts': [
-              {'text': message.content},
+              {
+                'functionResponse': {
+                  'name': message.name ?? message.toolCallId ?? '',
+                  'response': {'result': message.content},
+                },
+              },
             ],
           });
       }
@@ -328,6 +396,24 @@ class GoogleAdapter implements AiAdapter {
     };
     if (generationConfig.isNotEmpty) {
       body['generationConfig'] = generationConfig;
+    }
+
+    // Advertise callable tools as Gemini `functionDeclarations`. `tool_choice`
+    // is implicitly `auto` for Gemini when declarations are present.
+    final tools = request.tools;
+    if (tools != null && tools.isNotEmpty) {
+      body['tools'] = [
+        {
+          'functionDeclarations': [
+            for (final tool in tools)
+              {
+                'name': tool.name,
+                'description': tool.description,
+                'parameters': tool.parametersSchema,
+              },
+          ],
+        },
+      ];
     }
 
     return body;

@@ -10,6 +10,7 @@ import '../../../../domain/entities/ai/ai_message.dart';
 import '../../../../domain/entities/ai/ai_provider.dart';
 import '../../../../domain/entities/ai/ai_request.dart';
 import '../../../../domain/entities/ai/ai_response.dart';
+import '../../../../domain/entities/ai/ai_tool_call.dart';
 import 'ai_adapter.dart';
 
 /// [AiAdapter] for providers speaking Anthropic's Messages API
@@ -147,6 +148,13 @@ class AnthropicAdapter implements AiAdapter {
     String? finishReason;
     var terminated = false;
 
+    // Tool-use blocks are streamed incrementally: `content_block_start` opens a
+    // block (id + name) at an index, `input_json_delta` events append partial
+    // JSON for that index, and the assembled arguments are decoded on the
+    // terminal chunk. Keyed by block index since text and tool_use blocks
+    // interleave.
+    final toolUses = <int, _ToolUseAccumulator>{};
+
     // M1: decode the byte stream with a single stateful `utf8.decoder` (as the
     // OpenAI adapter does) so multibyte code points split across dio/TCP chunk
     // boundaries carry over instead of being corrupted to U+FFFD. `LineSplitter`
@@ -179,10 +187,30 @@ class AnthropicAdapter implements AiAdapter {
               : null;
           final (p, _) = _extractUsage(usage);
           promptTokens = p ?? promptTokens;
+        } else if (type == 'content_block_start') {
+          // A `tool_use` block opens with its id + name; capture them by index
+          // so subsequent `input_json_delta` events can be accumulated.
+          final index = event['index'];
+          final block = event['content_block'];
+          if (index is int && block is Map && block['type'] == 'tool_use') {
+            final id = block['id'];
+            final name = block['name'];
+            if (id is String && name is String) {
+              toolUses[index] = _ToolUseAccumulator(id: id, name: name);
+            }
+          }
         } else if (type == 'content_block_delta') {
           final delta = event['delta'];
-          if (delta is Map && delta['text'] is String) {
-            yield Right(AiChunk(delta: delta['text'] as String));
+          if (delta is Map) {
+            if (delta['type'] == 'input_json_delta' &&
+                delta['partial_json'] is String) {
+              final index = event['index'];
+              if (index is int) {
+                toolUses[index]?.input.write(delta['partial_json'] as String);
+              }
+            } else if (delta['text'] is String) {
+              yield Right(AiChunk(delta: delta['text'] as String));
+            }
           }
         } else if (type == 'message_delta') {
           final delta = event['delta'];
@@ -200,14 +228,16 @@ class AnthropicAdapter implements AiAdapter {
               finishReason: finishReason,
               promptTokens: promptTokens,
               completionTokens: completionTokens,
+              toolCalls: _assembleToolCalls(toolUses),
             ),
           );
         } else if (type == 'error') {
           yield Left(_failureFromErrorEvent(event['error']));
           return;
         }
-        // `ping`, `content_block_start`, and `content_block_stop` carry no
-        // user-visible payload and are ignored.
+        // `ping` and `content_block_stop` carry no extra payload we need (the
+        // assembled tool arguments are decoded on the terminal chunk) and are
+        // ignored.
       }
     } on DioException catch (e) {
       yield Left(_failureFromDio(e));
@@ -232,9 +262,46 @@ class AnthropicAdapter implements AiAdapter {
           finishReason: finishReason,
           promptTokens: promptTokens,
           completionTokens: completionTokens,
+          toolCalls: _assembleToolCalls(toolUses),
         ),
       );
     }
+  }
+
+  /// Decodes the per-index accumulated `input_json_delta` strings into
+  /// [AiToolCall]s, in ascending block-index order. Returns null when the round
+  /// produced no tool-use blocks so the terminal chunk stays text-only.
+  List<AiToolCall>? _assembleToolCalls(Map<int, _ToolUseAccumulator> toolUses) {
+    if (toolUses.isEmpty) return null;
+    final indices = toolUses.keys.toList()..sort();
+    final calls = <AiToolCall>[];
+    for (final index in indices) {
+      final accumulator = toolUses[index]!;
+      final raw = accumulator.input.toString();
+      Map<String, dynamic> arguments;
+      if (raw.trim().isEmpty) {
+        // A tool with no parameters streams no `input_json_delta` events.
+        arguments = <String, dynamic>{};
+      } else {
+        try {
+          final decoded = jsonDecode(raw);
+          arguments =
+              decoded is Map<String, dynamic> ? decoded : <String, dynamic>{};
+        } catch (_) {
+          // L12: malformed partial JSON shouldn't crash the stream; surface an
+          // empty argument set and let the agent loop recover.
+          arguments = <String, dynamic>{};
+        }
+      }
+      calls.add(
+        AiToolCall(
+          id: accumulator.id,
+          name: accumulator.name,
+          arguments: arguments,
+        ),
+      );
+    }
+    return calls;
   }
 
   /// Resolves the Messages endpoint, defaulting to the first-party API when no
@@ -268,9 +335,45 @@ class AnthropicAdapter implements AiAdapter {
         case AiRole.user:
           messages.add({'role': 'user', 'content': message.content});
         case AiRole.assistant:
-          messages.add({'role': 'assistant', 'content': message.content});
+          // An assistant turn that requested tools becomes a content-block list
+          // mixing any leading text with one `tool_use` block per call. A plain
+          // assistant turn keeps the simple string-content form.
+          final toolCalls = message.toolCalls;
+          if (toolCalls != null && toolCalls.isNotEmpty) {
+            final content = <Map<String, dynamic>>[];
+            if (message.content.isNotEmpty) {
+              content.add({'type': 'text', 'text': message.content});
+            }
+            for (final call in toolCalls) {
+              content.add({
+                'type': 'tool_use',
+                'id': call.id,
+                'name': call.name,
+                'input': call.arguments,
+              });
+            }
+            messages.add({'role': 'assistant', 'content': content});
+          } else {
+            messages.add({'role': 'assistant', 'content': message.content});
+          }
+        case AiRole.tool:
+          // Anthropic has no `tool` role: a tool result is carried as a
+          // `tool_result` content block inside a `user` message, keyed back to
+          // the originating call via `tool_use_id`.
+          messages.add({
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': message.toolCallId,
+                'content': message.content,
+              },
+            ],
+          });
       }
     }
+
+    final tools = request.tools;
 
     return {
       'model': request.modelId,
@@ -278,6 +381,15 @@ class AnthropicAdapter implements AiAdapter {
       'messages': messages,
       'system': ?system,
       'temperature': ?request.temperature,
+      if (tools != null && tools.isNotEmpty)
+        'tools': [
+          for (final tool in tools)
+            {
+              'name': tool.name,
+              'description': tool.description,
+              'input_schema': tool.parametersSchema,
+            },
+        ],
       if (stream) 'stream': true,
     };
   }
@@ -348,17 +460,24 @@ class AnthropicAdapter implements AiAdapter {
   }
 
   /// Maps an Anthropic SSE `error` event payload onto an [AiFailure].
+  ///
+  /// L12: the provider's raw `message` is captured for diagnostics only — never
+  /// surfaced to the caller. We classify by the event `type` and return a fixed
+  /// user-safe message (mirroring the OpenAI/Google adapters).
   Failure _failureFromErrorEvent(dynamic error) {
     var type = '';
-    var message = 'Anthropic stream error.';
+    String? detail;
     if (error is Map) {
       if (error['type'] is String) type = error['type'] as String;
-      if (error['message'] is String) message = error['message'] as String;
+      if (error['message'] is String) detail = error['message'] as String;
+    }
+    if (detail != null) {
+      debugPrint('AnthropicAdapter stream error (type $type): $detail');
     }
     if (type.contains('rate_limit') || type.contains('overloaded')) {
-      return RateLimited(message: message);
+      return const RateLimited(message: 'Anthropic is rate limiting requests.');
     }
-    return ServerFailure(message: message);
+    return const ServerFailure(message: 'Anthropic stream error.');
   }
 
   /// Extracts a human-readable message from an Anthropic error body
@@ -375,4 +494,17 @@ class AnthropicAdapter implements AiAdapter {
     if (data is String && data.isNotEmpty) return data;
     return null;
   }
+}
+
+/// Mutable per-block accumulator for a streamed Anthropic `tool_use` block.
+///
+/// The id and name arrive on `content_block_start`; the argument JSON streams
+/// in fragments across `input_json_delta` events and is decoded only once the
+/// block (or message) completes.
+class _ToolUseAccumulator {
+  _ToolUseAccumulator({required this.id, required this.name});
+
+  final String id;
+  final String name;
+  final StringBuffer input = StringBuffer();
 }

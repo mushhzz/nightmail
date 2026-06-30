@@ -23,6 +23,11 @@ class AiSettingsCubit extends Cubit<AiSettingsState> {
   final AiCatalogRepository _catalogRepository;
   final AiSettingsRepository _settingsRepository;
 
+  /// Supported range for folder-agent caps. Mirrors the clamp applied by
+  /// [AiSettingsRepository], so emitted state matches the persisted value.
+  static const int _minCap = 1;
+  static const int _maxCap = 20;
+
   /// Loads providers and the current routing table.
   ///
   /// When [forceRefresh] is `true` the catalog is refreshed from models.dev in
@@ -45,6 +50,13 @@ class AiSettingsCubit extends Cubit<AiSettingsState> {
         // false (the safe default), so cloud routes omit the quoted body.
         final allowCloud = (await _settingsRepository.getAllowCloudForBodies())
             .getOrElse((_) => false);
+        // Folder-agent caps: absent/error → today's compile-time defaults
+        // (5 rounds, 8 tool calls per round). The repo also clamps to 1–20.
+        final agentMaxRounds =
+            (await _settingsRepository.getAgentMaxRounds()).getOrElse((_) => 5);
+        final agentMaxToolCallsPerRound =
+            (await _settingsRepository.getAgentMaxToolCallsPerRound())
+                .getOrElse((_) => 8);
         if (isClosed) return;
         emit(state.copyWith(
           status: AiSettingsStatus.loaded,
@@ -52,6 +64,8 @@ class AiSettingsCubit extends Cubit<AiSettingsState> {
           configured: configured,
           routing: routing,
           allowCloudForBodies: allowCloud,
+          agentMaxRounds: agentMaxRounds,
+          agentMaxToolCallsPerRound: agentMaxToolCallsPerRound,
           errorMessage: null,
         ));
       },
@@ -206,6 +220,33 @@ class AiSettingsCubit extends Cubit<AiSettingsState> {
     result.fold(
       (failure) => _emitError(failure.message),
       (_) => emit(state.copyWith(allowCloudForBodies: value)),
+    );
+  }
+
+  /// Folder-agent cap: sets the maximum number of tool-calling rounds the agent
+  /// runs per turn. Persists via [AiSettingsRepository] (which clamps to 1–20)
+  /// and reflects the new value in state.
+  Future<void> setAgentMaxRounds(int value) async {
+    final clamped = value.clamp(_minCap, _maxCap);
+    final result = await _settingsRepository.setAgentMaxRounds(clamped);
+    if (isClosed) return;
+    result.fold(
+      (failure) => _emitError(failure.message),
+      (_) => emit(state.copyWith(agentMaxRounds: clamped)),
+    );
+  }
+
+  /// Folder-agent cap: sets the maximum number of tool calls the agent may make
+  /// per round. Persists via [AiSettingsRepository] (which clamps to 1–20) and
+  /// reflects the new value in state.
+  Future<void> setAgentMaxToolCallsPerRound(int value) async {
+    final clamped = value.clamp(_minCap, _maxCap);
+    final result =
+        await _settingsRepository.setAgentMaxToolCallsPerRound(clamped);
+    if (isClosed) return;
+    result.fold(
+      (failure) => _emitError(failure.message),
+      (_) => emit(state.copyWith(agentMaxToolCallsPerRound: clamped)),
     );
   }
 

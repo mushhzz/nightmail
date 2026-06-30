@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../../core/theme/app_colors.dart';
@@ -331,9 +332,46 @@ class _AiSettingsViewState extends State<_AiSettingsView> {
           const SizedBox(height: 24),
           Divider(height: 1, color: c.separator),
           const SizedBox(height: 24),
+          _buildAgentCaps(context, state),
+          const SizedBox(height: 24),
+          Divider(height: 1, color: c.separator),
+          const SizedBox(height: 24),
           _buildPrivacy(context, state),
         ],
       ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Folder agent — configurable safety caps
+  // ---------------------------------------------------------------------------
+
+  /// Two user-configurable bounds for the folder-reading agent loop: how many
+  /// tool steps it may take per turn (`agentMaxRounds`) and how many emails it
+  /// may read in one step (`agentMaxToolCallsPerRound`). Both default to the old
+  /// compile-time constants (5 / 8) and clamp to 1–20, so the loop can never run
+  /// unbounded. (`RunFolderAgent` reads the same settings to enforce them.)
+  Widget _buildAgentCaps(BuildContext context, AiSettingsState state) {
+    final c = context.colors;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _Label('Folder agent'),
+        const SizedBox(height: 4),
+        Text(
+          'Limits on how hard the agent works through a folder when answering.',
+          style: TextStyle(color: c.textMuted, fontSize: 12),
+        ),
+        const SizedBox(height: 12),
+        _AgentCapsSection(
+          maxRounds: state.agentMaxRounds,
+          maxToolCallsPerRound: state.agentMaxToolCallsPerRound,
+          onMaxRoundsChanged: (v) =>
+              context.read<AiSettingsCubit>().setAgentMaxRounds(v),
+          onMaxToolCallsChanged: (v) =>
+              context.read<AiSettingsCubit>().setAgentMaxToolCallsPerRound(v),
+        ),
+      ],
     );
   }
 
@@ -1473,6 +1511,192 @@ class _CloudBodiesToggle extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Bordered container holding the two folder-agent caps, styled like
+/// [_CloudBodiesToggle]. Each cap is a [_AgentCapRow]: a label + helper, an
+/// editable number field, and a slider, all bound to the same clamped value.
+class _AgentCapsSection extends StatelessWidget {
+  const _AgentCapsSection({
+    required this.maxRounds,
+    required this.maxToolCallsPerRound,
+    required this.onMaxRoundsChanged,
+    required this.onMaxToolCallsChanged,
+  });
+
+  final int maxRounds;
+  final int maxToolCallsPerRound;
+  final ValueChanged<int> onMaxRoundsChanged;
+  final ValueChanged<int> onMaxToolCallsChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+      decoration: BoxDecoration(
+        border: Border.all(color: c.separatorStrong),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _AgentCapRow(
+            label: 'Max steps per turn',
+            helper: 'How many tool steps the agent takes per turn.',
+            value: maxRounds,
+            onChanged: onMaxRoundsChanged,
+          ),
+          const SizedBox(height: 16),
+          _AgentCapRow(
+            label: 'Max tool calls per step',
+            helper: 'How many tools it can call in a single step.',
+            value: maxToolCallsPerRound,
+            onChanged: onMaxToolCallsChanged,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One folder-agent cap: a [_Label] + helper, an editable digits-only number
+/// field, and a [Slider]. Both controls drive the same value via [onChanged]
+/// (clamped to [_min]–[_max]); the field and slider stay in sync with [value]
+/// from cubit state. Empty/out-of-range typed input snaps to the clamped value.
+class _AgentCapRow extends StatefulWidget {
+  const _AgentCapRow({
+    required this.label,
+    required this.helper,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final String helper;
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  @override
+  State<_AgentCapRow> createState() => _AgentCapRowState();
+}
+
+class _AgentCapRowState extends State<_AgentCapRow> {
+  static const int _min = 1;
+  static const int _max = 20;
+
+  final _controller = TextEditingController();
+  final _focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.text = widget.value.toString();
+    // Commit on blur so a typed value persists even without pressing enter.
+    _focusNode.addListener(() {
+      if (!_focusNode.hasFocus) _commit();
+    });
+  }
+
+  @override
+  void didUpdateWidget(_AgentCapRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Reflect external value changes (e.g. the slider) into the field. We
+    // reconcile even while focused so a newer slider value isn't later
+    // overwritten by a stale draft on blur — only rewrite when the new value
+    // differs from what the field currently parses to, so we don't clobber an
+    // in-progress edit that already matches.
+    if (widget.value != oldWidget.value &&
+        int.tryParse(_controller.text.trim()) != widget.value) {
+      _controller.text = widget.value.toString();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  int _clamp(int v) => v < _min ? _min : (v > _max ? _max : v);
+
+  /// Parse + clamp the typed text, snap the field back to the clamped string,
+  /// and only notify when the value actually changed.
+  void _commit() {
+    final parsed = int.tryParse(_controller.text.trim());
+    final clamped = _clamp(parsed ?? widget.value);
+    final text = clamped.toString();
+    if (_controller.text != text) _controller.text = text;
+    if (clamped != widget.value) widget.onChanged(clamped);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _Label(widget.label),
+                  const SizedBox(height: 2),
+                  Text(
+                    widget.helper,
+                    style: TextStyle(color: c.textMuted, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 56,
+              height: 32,
+              child: TextField(
+                controller: _controller,
+                focusNode: _focusNode,
+                onSubmitted: (_) => _commit(),
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                textAlign: TextAlign.center,
+                style: TextStyle(color: c.textSecondary, fontSize: 12),
+                decoration: InputDecoration(
+                  isDense: true,
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide(color: c.separatorStrong),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: AppColors.accent),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        Slider(
+          value: _clamp(widget.value).toDouble(),
+          min: _min.toDouble(),
+          max: _max.toDouble(),
+          divisions: _max - _min,
+          activeColor: AppColors.accent,
+          label: _clamp(widget.value).toString(),
+          onChanged: (v) {
+            final next = _clamp(v.round());
+            if (next != widget.value) widget.onChanged(next);
+          },
+        ),
+      ],
     );
   }
 }

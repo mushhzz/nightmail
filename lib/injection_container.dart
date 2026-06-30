@@ -37,7 +37,7 @@ import 'domain/repositories/ai/ai_catalog_repository.dart';
 import 'domain/repositories/ai/ai_inference_repository.dart';
 import 'domain/repositories/ai/ai_settings_repository.dart';
 import 'domain/usecases/ai/compose_reply.dart';
-import 'domain/usecases/ai/query_email_folder.dart';
+import 'domain/usecases/ai/run_folder_agent.dart';
 import 'presentation/blocs/ai/ai_compose_cubit.dart';
 import 'presentation/blocs/ai/ai_folder_cubit.dart';
 import 'presentation/blocs/ai/ai_settings_cubit.dart';
@@ -408,18 +408,24 @@ Future<void> configureDependencies() async {
     ),
   );
 
+  // Folder agent loop (§3): builds its four read-only AgentTools internally,
+  // so they are not registered separately.
   sl.registerLazySingleton(
-    () => QueryEmailFolder(
+    () => RunFolderAgent(
       settingsRepository: sl<AiSettingsRepository>(),
       inferenceRepository: sl<AiInferenceRepository>(),
       catalogRepository: sl<AiCatalogRepository>(),
+      getEmails: sl<GetEmails>(),
+      getEmail: sl<GetEmail>(),
+      searchEmails: sl<SearchEmails>(),
+      getMailFolders: sl<GetMailFolders>(),
     ),
   );
 
   // Presentation — AI cubits (factories)
   sl.registerFactory(() => AiComposeCubit(composeReply: sl<ComposeReply>()));
   sl.registerFactory(
-    () => AiFolderCubit(queryEmailFolder: sl<QueryEmailFolder>()),
+    () => AiFolderCubit(runFolderAgent: sl<RunFolderAgent>()),
   );
   sl.registerFactory(
     () => AiSettingsCubit(

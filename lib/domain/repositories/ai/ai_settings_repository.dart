@@ -62,6 +62,24 @@ abstract interface class AiSettingsRepository {
 
   /// Sets the "send mail bodies to cloud providers" guard.
   Future<Either<Failure, Unit>> setAllowCloudForBodies(bool allow);
+
+  // --- Folder agent -------------------------------------------------------
+
+  /// The maximum number of reasoning/tool rounds the folder agent may run in a
+  /// single turn. Defaults to `5` and is clamped to the range `1–20`.
+  Future<Either<Failure, int>> getAgentMaxRounds();
+
+  /// Sets the folder agent's maximum rounds per turn. The value is clamped to
+  /// the range `1–20` before being stored.
+  Future<Either<Failure, Unit>> setAgentMaxRounds(int value);
+
+  /// The maximum number of tool calls the folder agent may make within a single
+  /// round. Defaults to `8` and is clamped to the range `1–20`.
+  Future<Either<Failure, int>> getAgentMaxToolCallsPerRound();
+
+  /// Sets the folder agent's maximum tool calls per round. The value is clamped
+  /// to the range `1–20` before being stored.
+  Future<Either<Failure, Unit>> setAgentMaxToolCallsPerRound(int value);
 }
 
 /// A resolved per-capability route: the provider and model a feature should use.

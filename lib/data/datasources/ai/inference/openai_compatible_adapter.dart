@@ -10,6 +10,8 @@ import '../../../../domain/entities/ai/ai_message.dart';
 import '../../../../domain/entities/ai/ai_provider.dart';
 import '../../../../domain/entities/ai/ai_request.dart';
 import '../../../../domain/entities/ai/ai_response.dart';
+import '../../../../domain/entities/ai/ai_tool_call.dart';
+import '../../../../domain/entities/ai/ai_tool_definition.dart';
 import 'ai_adapter.dart';
 
 /// Fallback base URL used only when an empty [baseUrl] is supplied.
@@ -22,6 +24,10 @@ const _kDefaultOpenAiBaseUrl = 'https://api.openai.com/v1';
 /// every provider on the [AiWireProtocol.openai] protocol — credentials and the
 /// endpoint are passed per call. The shared [Dio] singleton is injected once and
 /// never rebuilt.
+///
+/// Ollama ([AiWireProtocol.ollama]) is also served here — its `/v1`
+/// OpenAI-compatibility surface accepts the same `tools` array, so the §7
+/// tool-calling wire work in this adapter covers Ollama too (no separate adapter).
 class OpenAiCompatibleAdapter implements AiAdapter {
   const OpenAiCompatibleAdapter({
     required Dio dio,
@@ -69,6 +75,10 @@ class OpenAiCompatibleAdapter implements AiAdapter {
         'messages': request.messages.map(_encodeMessage).toList(),
         if (request.temperature != null) 'temperature': request.temperature,
         if (request.maxTokens != null) 'max_tokens': request.maxTokens,
+        if (request.tools != null && request.tools!.isNotEmpty) ...{
+          'tools': request.tools!.map(_encodeTool).toList(),
+          'tool_choice': 'auto',
+        },
       };
 
   /// Request body for the OpenAI Responses API (`/responses`).
@@ -81,12 +91,66 @@ class OpenAiCompatibleAdapter implements AiAdapter {
         'input': request.messages.map(_encodeMessage).toList(),
         if (request.temperature != null) 'temperature': request.temperature,
         if (request.maxTokens != null) 'max_output_tokens': request.maxTokens,
+        // Tool calling is NOT yet implemented for the Responses shape: the
+        // Responses API uses a different `tools` schema (flat
+        // `{type, name, description, parameters}`, not the Chat-Completions
+        // `{type:'function', function:{…}}` shape produced by [_encodeTool]),
+        // and the Responses parsers do not yet read tool-call output. Attaching
+        // the Chat-Completions wiring here would send malformed tools and
+        // silently drop any tool calls, so it is intentionally omitted — a
+        // responses request simply runs without tools until proper Responses
+        // tool wiring + parsing lands.
       };
 
-  Map<String, dynamic> _encodeMessage(AiMessage m) => {
-        'role': m.role.name,
+  /// Encodes an [AiToolDefinition] into the OpenAI `function`-tool wire shape.
+  Map<String, dynamic> _encodeTool(AiToolDefinition tool) => {
+        'type': 'function',
+        'function': {
+          'name': tool.name,
+          'description': tool.description,
+          'parameters': tool.parametersSchema,
+        },
+      };
+
+  Map<String, dynamic> _encodeMessage(AiMessage m) {
+    // A `tool`-role turn carries the result of an executed tool call, keyed
+    // back to the originating call via `tool_call_id`.
+    if (m.role == AiRole.tool) {
+      return {
+        'role': 'tool',
+        if (m.toolCallId != null) 'tool_call_id': m.toolCallId,
         'content': m.content,
       };
+    }
+
+    // An assistant turn requesting tools emits `tool_calls`; its textual
+    // `content` may be empty/null when the model only asked for tools.
+    final toolCalls = m.toolCalls;
+    if (m.role == AiRole.assistant &&
+        toolCalls != null &&
+        toolCalls.isNotEmpty) {
+      return {
+        'role': 'assistant',
+        'content': m.content.isEmpty ? null : m.content,
+        'tool_calls': [
+          for (final call in toolCalls)
+            {
+              'id': call.id,
+              'type': 'function',
+              'function': {
+                'name': call.name,
+                'arguments': jsonEncode(call.arguments),
+              },
+            },
+        ],
+      };
+    }
+
+    return {
+      'role': m.role.name,
+      'content': m.content,
+    };
+  }
 
   // --------------------------------------------------------------------------
   // Single-shot
@@ -295,6 +359,49 @@ class OpenAiCompatibleAdapter implements AiAdapter {
     int? completionTokens;
     var terminated = false;
 
+    // Streamed `delta.tool_calls[]` fragments accumulated by their `index`:
+    // the id + function.name arrive on first sight, while function.arguments
+    // is delivered as a sequence of string fragments that we concatenate.
+    final toolIds = <int, String>{};
+    final toolNames = <int, String>{};
+    final toolArgs = <int, StringBuffer>{};
+
+    // Assembles the accumulated fragments into [AiToolCall]s, JSON-decoding
+    // each arguments string into a Map (empty Map if blank or unparseable).
+    // Returns null when no tool-call fragments were seen.
+    List<AiToolCall>? buildToolCalls() {
+      final indices = <int>{
+        ...toolIds.keys,
+        ...toolNames.keys,
+        ...toolArgs.keys,
+      }.toList()
+        ..sort();
+      if (indices.isEmpty) return null;
+
+      final calls = <AiToolCall>[];
+      for (final i in indices) {
+        final argStr = toolArgs[i]?.toString() ?? '';
+        Map<String, dynamic> args;
+        try {
+          final decoded =
+              argStr.trim().isEmpty ? <String, dynamic>{} : jsonDecode(argStr);
+          args = decoded is Map
+              ? Map<String, dynamic>.from(decoded)
+              : <String, dynamic>{};
+        } catch (_) {
+          args = <String, dynamic>{};
+        }
+        calls.add(
+          AiToolCall(
+            id: toolIds[i] ?? '',
+            name: toolNames[i] ?? '',
+            arguments: args,
+          ),
+        );
+      }
+      return calls;
+    }
+
     try {
       await for (final raw in lines) {
         final line = raw.trim();
@@ -303,13 +410,15 @@ class OpenAiCompatibleAdapter implements AiAdapter {
         final payload = line.substring(5).trim();
         if (payload == '[DONE]') {
           terminated = true;
+          final calls = buildToolCalls();
           yield Right(
             AiChunk(
               delta: '',
               done: true,
-              finishReason: finishReason,
+              finishReason: calls != null ? 'tool_calls' : finishReason,
               promptTokens: promptTokens,
               completionTokens: completionTokens,
+              toolCalls: calls,
             ),
           );
           return;
@@ -336,9 +445,48 @@ class OpenAiCompatibleAdapter implements AiAdapter {
           if (fr is String) finishReason = fr;
 
           final delta = choice['delta'];
-          final content = (delta is Map) ? delta['content'] : null;
-          if (content is String && content.isNotEmpty) {
-            yield Right(AiChunk(delta: content));
+          if (delta is Map) {
+            final content = delta['content'];
+            if (content is String && content.isNotEmpty) {
+              yield Right(AiChunk(delta: content));
+            }
+
+            final fragments = delta['tool_calls'];
+            if (fragments is List) {
+              for (final fragment in fragments) {
+                if (fragment is! Map) continue;
+                final index = (fragment['index'] as num?)?.toInt() ?? 0;
+                final id = fragment['id'];
+                if (id is String && id.isNotEmpty) toolIds[index] = id;
+                final function = fragment['function'];
+                if (function is Map) {
+                  final name = function['name'];
+                  if (name is String && name.isNotEmpty) {
+                    toolNames[index] = name;
+                  }
+                  final args = function['arguments'];
+                  if (args is String) {
+                    (toolArgs[index] ??= StringBuffer()).write(args);
+                  }
+                }
+              }
+            }
+          }
+
+          // A terminal `tool_calls` round: emit the assembled calls and stop.
+          if (finishReason == 'tool_calls') {
+            terminated = true;
+            yield Right(
+              AiChunk(
+                delta: '',
+                done: true,
+                finishReason: 'tool_calls',
+                promptTokens: promptTokens,
+                completionTokens: completionTokens,
+                toolCalls: buildToolCalls(),
+              ),
+            );
+            return;
           }
         }
       }
@@ -355,14 +503,18 @@ class OpenAiCompatibleAdapter implements AiAdapter {
     }
 
     // Some compatible servers close the stream without an explicit `[DONE]`.
+    // If tool-call fragments accumulated without a `tool_calls` finish_reason,
+    // still surface them as a terminal tool-call chunk.
     if (!terminated) {
+      final calls = buildToolCalls();
       yield Right(
         AiChunk(
           delta: '',
           done: true,
-          finishReason: finishReason,
+          finishReason: calls != null ? 'tool_calls' : finishReason,
           promptTokens: promptTokens,
           completionTokens: completionTokens,
+          toolCalls: calls,
         ),
       );
     }

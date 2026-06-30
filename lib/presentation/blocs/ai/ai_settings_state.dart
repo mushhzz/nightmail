@@ -18,6 +18,8 @@ class AiSettingsState extends Equatable {
     this.configured = const [],
     this.routing = const {},
     this.allowCloudForBodies = false,
+    this.agentMaxRounds = 5,
+    this.agentMaxToolCallsPerRound = 8,
     this.errorMessage,
   });
 
@@ -41,6 +43,14 @@ class AiSettingsState extends Equatable {
   /// allow sending message bodies to cloud providers.
   final bool allowCloudForBodies;
 
+  /// Folder-agent cap: how many tool-calling rounds the agent may run per turn.
+  /// Default `5`, clamped to 1–20 by the repository.
+  final int agentMaxRounds;
+
+  /// Folder-agent cap: how many tool calls the agent may make per round.
+  /// Default `8`, clamped to 1–20 by the repository.
+  final int agentMaxToolCallsPerRound;
+
   /// Human-readable error message when [status] is [AiSettingsStatus.error].
   final String? errorMessage;
 
@@ -57,6 +67,8 @@ class AiSettingsState extends Equatable {
     List<AiProvider>? configured,
     Map<AiCapability, AiRouting>? routing,
     bool? allowCloudForBodies,
+    int? agentMaxRounds,
+    int? agentMaxToolCallsPerRound,
     Object? errorMessage = _unset,
   }) {
     return AiSettingsState(
@@ -65,6 +77,9 @@ class AiSettingsState extends Equatable {
       configured: configured ?? this.configured,
       routing: routing ?? this.routing,
       allowCloudForBodies: allowCloudForBodies ?? this.allowCloudForBodies,
+      agentMaxRounds: agentMaxRounds ?? this.agentMaxRounds,
+      agentMaxToolCallsPerRound:
+          agentMaxToolCallsPerRound ?? this.agentMaxToolCallsPerRound,
       errorMessage: errorMessage == _unset
           ? this.errorMessage
           : errorMessage as String?,
@@ -72,8 +87,16 @@ class AiSettingsState extends Equatable {
   }
 
   @override
-  List<Object?> get props =>
-      [status, providers, configured, routing, allowCloudForBodies, errorMessage];
+  List<Object?> get props => [
+        status,
+        providers,
+        configured,
+        routing,
+        allowCloudForBodies,
+        agentMaxRounds,
+        agentMaxToolCallsPerRound,
+        errorMessage,
+      ];
 }
 
 const _unset = Object();

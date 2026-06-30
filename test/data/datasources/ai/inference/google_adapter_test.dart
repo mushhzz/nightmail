@@ -11,6 +11,8 @@ import 'package:nightmail/data/datasources/ai/inference/google_adapter.dart';
 import 'package:nightmail/domain/entities/ai/ai_message.dart';
 import 'package:nightmail/domain/entities/ai/ai_request.dart';
 import 'package:nightmail/domain/entities/ai/ai_response.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_call.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_definition.dart';
 
 import 'google_adapter_test.mocks.dart';
 
@@ -865,6 +867,311 @@ void main() {
           options: anyNamed('options'),
         ),
       );
+    });
+  });
+
+  group('tool support (§7)', () {
+    Uint8List sse(String s) => Uint8List.fromList(utf8.encode(s));
+
+    const listEmailsTool = AiToolDefinition(
+      name: 'list_emails',
+      description: 'List emails in the current folder.',
+      parametersSchema: {
+        'type': 'object',
+        'properties': {
+          'limit': {'type': 'integer'},
+        },
+        'required': ['limit'],
+      },
+    );
+
+    // Stub a benign non-stream generateContent response so `run` reaches the
+    // body-building path without throwing; the tests only inspect the captured
+    // request body, not the response.
+    void stubOkResponse() {
+      when(
+        mockDio.post<dynamic>(
+          any,
+          data: anyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).thenAnswer(
+        (_) async => Response<dynamic>(
+          data: const {
+            'candidates': [
+              {
+                'content': {
+                  'parts': [
+                    {'text': 'ok'},
+                  ],
+                },
+              },
+            ],
+          },
+          statusCode: 200,
+          requestOptions: RequestOptions(path: '/models'),
+        ),
+      );
+    }
+
+    Map<String, dynamic> capturedBody() {
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      return captured.single as Map<String, dynamic>;
+    }
+
+    test('advertises request tools as a single functionDeclarations block',
+        () async {
+      stubOkResponse();
+
+      await adapter.run(
+        const AiRequest(
+          providerId: 'google',
+          modelId: 'gemini-1.5-flash',
+          messages: [
+            AiMessage(role: AiRole.user, content: 'What is in my inbox?'),
+          ],
+          tools: [listEmailsTool],
+        ),
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+      );
+
+      final body = capturedBody();
+
+      expect(body['tools'], [
+        {
+          'functionDeclarations': [
+            {
+              'name': 'list_emails',
+              'description': 'List emails in the current folder.',
+              'parameters': {
+                'type': 'object',
+                'properties': {
+                  'limit': {'type': 'integer'},
+                },
+                'required': ['limit'],
+              },
+            },
+          ],
+        },
+      ]);
+    });
+
+    test('omits the tools key entirely when no tools are supplied', () async {
+      stubOkResponse();
+
+      await adapter.run(
+        const AiRequest(
+          providerId: 'google',
+          modelId: 'gemini-1.5-flash',
+          messages: [AiMessage(role: AiRole.user, content: 'Hi')],
+        ),
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+      );
+
+      expect(capturedBody().containsKey('tools'), isFalse);
+    });
+
+    test(
+        'encodes an assistant tool call as a model functionCall part and a '
+        'tool result as a user functionResponse part', () async {
+      stubOkResponse();
+
+      await adapter.run(
+        const AiRequest(
+          providerId: 'google',
+          modelId: 'gemini-1.5-flash',
+          tools: [listEmailsTool],
+          messages: [
+            AiMessage(role: AiRole.user, content: 'Summarize my unread mail.'),
+            AiMessage(
+              role: AiRole.assistant,
+              content: '',
+              toolCalls: [
+                AiToolCall(
+                  id: 'list_emails-0',
+                  name: 'list_emails',
+                  arguments: {'limit': 5},
+                ),
+              ],
+            ),
+            AiMessage(
+              role: AiRole.tool,
+              content: 'Found 3 unread emails.',
+              name: 'list_emails',
+              toolCallId: 'list_emails-0',
+            ),
+          ],
+        ),
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+      );
+
+      final contents =
+          (capturedBody()['contents'] as List).cast<Map<String, dynamic>>();
+
+      // The assistant turn (spelled `model`) carries a functionCall part with
+      // the call's name + parsed args, and no spurious empty text part.
+      final modelTurn = contents.firstWhere((c) => c['role'] == 'model');
+      final modelParts =
+          (modelTurn['parts'] as List).cast<Map<String, dynamic>>();
+      expect(modelParts, [
+        {
+          'functionCall': {
+            'name': 'list_emails',
+            'args': {'limit': 5},
+          },
+        },
+      ]);
+
+      // The tool-result turn maps to a user-role functionResponse part keyed
+      // back to the function by name, with the result wrapped in {result: ...}.
+      final responseTurn = contents.lastWhere(
+        (c) => (c['parts'] as List)
+            .any((p) => (p as Map).containsKey('functionResponse')),
+      );
+      expect(responseTurn['role'], 'user');
+      final responseParts =
+          (responseTurn['parts'] as List).cast<Map<String, dynamic>>();
+      expect(responseParts.single['functionResponse'], {
+        'name': 'list_emails',
+        'response': {'result': 'Found 3 unread emails.'},
+      });
+
+      // No tool-result content leaks out as a plain assistant/model text part.
+      expect(
+        modelParts.any((p) => p.containsKey('text')),
+        isFalse,
+        reason: 'an empty assistant content must not emit a text part',
+      );
+    });
+
+    test(
+        'assembles streamed functionCall parts into toolCalls on a single '
+        'terminal chunk with a tool_calls finishReason', () async {
+      final events = <Uint8List>[
+        sse(
+          'data: {"candidates":[{"content":{"role":"model","parts":['
+          '{"functionCall":{"name":"list_emails","args":{"limit":5}}},'
+          '{"functionCall":{"name":"get_email","args":{"id":"42"}}}'
+          ']},"finishReason":"STOP"}],'
+          '"usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":9}}'
+          '\n\n',
+        ),
+      ];
+
+      when(
+        mockDio.post<ResponseBody>(
+          any,
+          data: anyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).thenAnswer(
+        (_) async => Response<ResponseBody>(
+          data: ResponseBody(Stream.fromIterable(events), 200),
+          statusCode: 200,
+          requestOptions: RequestOptions(path: '/models'),
+        ),
+      );
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      expect(chunks.every((c) => c.isRight()), isTrue);
+      final aiChunks = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .toList();
+
+      // A pure tool-call round emits no visible text deltas, only the terminal.
+      expect(aiChunks.where((c) => !c.done).any((c) => c.delta.isNotEmpty),
+          isFalse);
+
+      final done = aiChunks.singleWhere((c) => c.done);
+      expect(done.delta, '');
+      // The Gemini finishReason (STOP) is overridden with the normalized
+      // tool_calls signal so the agent loop knows to execute the calls.
+      expect(done.finishReason, 'tool_calls');
+      expect(done.promptTokens, 40);
+      expect(done.completionTokens, 9);
+
+      // Both functionCall parts are assembled, in order, with synthesized
+      // `<name>-<ordinal>` ids and parsed argument maps.
+      expect(done.toolCalls, [
+        const AiToolCall(
+          id: 'list_emails-0',
+          name: 'list_emails',
+          arguments: {'limit': 5},
+        ),
+        const AiToolCall(
+          id: 'get_email-1',
+          name: 'get_email',
+          arguments: {'id': '42'},
+        ),
+      ]);
+    });
+
+    test(
+        'emits leading text deltas and still assembles a trailing functionCall '
+        'into the terminal toolCalls', () async {
+      final events = <Uint8List>[
+        sse(
+          'data: {"candidates":[{"content":{"role":"model","parts":['
+          '{"text":"Let me check. "}]}}]}\n\n',
+        ),
+        sse(
+          'data: {"candidates":[{"content":{"role":"model","parts":['
+          '{"functionCall":{"name":"list_emails","args":{}}}'
+          ']},"finishReason":"STOP"}]}\n\n',
+        ),
+      ];
+
+      when(
+        mockDio.post<ResponseBody>(
+          any,
+          data: anyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).thenAnswer(
+        (_) async => Response<ResponseBody>(
+          data: ResponseBody(Stream.fromIterable(events), 200),
+          statusCode: 200,
+          requestOptions: RequestOptions(path: '/models'),
+        ),
+      );
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      final aiChunks = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .toList();
+
+      // The pre-call narration is streamed as a visible delta.
+      expect(
+        aiChunks.takeWhile((c) => !c.done).map((c) => c.delta).join(),
+        'Let me check. ',
+      );
+
+      // Exactly one terminal chunk, carrying the empty-args call and the
+      // tool_calls finishReason.
+      final done = aiChunks.singleWhere((c) => c.done);
+      expect(done.finishReason, 'tool_calls');
+      expect(done.toolCalls, [
+        const AiToolCall(
+          id: 'list_emails-0',
+          name: 'list_emails',
+          arguments: <String, dynamic>{},
+        ),
+      ]);
     });
   });
 }

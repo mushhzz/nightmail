@@ -3,21 +3,27 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_gen_ai_chat_ui/flutter_gen_ai_chat_ui.dart';
 
 import '../../core/theme/app_colors.dart';
-import '../blocs/ai/ai_compose_state.dart';
+import '../blocs/ai/ai_folder_chat_state.dart';
 import '../blocs/ai/ai_folder_cubit.dart';
+import 'ai/tool_call_card.dart';
 
 class AiDayPanel extends StatefulWidget {
   const AiDayPanel({
     super.key,
     required this.onClose,
+    this.folderIdProvider,
     this.contextProvider,
   });
 
   final VoidCallback onClose;
 
-  /// Called just before generation to collect the context string to pass to the
-  /// AI (e.g. a formatted excerpt of the current folder's emails). Returns null
-  /// when no context is available.
+  /// Called just before each turn to resolve the current folder's id, which the
+  /// agent's tools default to. Returns null when no folder is selected.
+  final String? Function()? folderIdProvider;
+
+  /// Called just before each turn to collect the fallback context string (a
+  /// formatted excerpt of the current folder's emails). Used only when the
+  /// routed model lacks tool calling. Returns null when no context is available.
   final String? Function()? contextProvider;
 
   @override
@@ -31,14 +37,16 @@ class _AiDayPanelState extends State<AiDayPanel> {
   static const _user = ChatUser(id: 'user', name: 'You');
   static const _ai = ChatUser(id: 'ai', name: 'AI Assistant');
 
-  /// Whether a generation is in flight; drives the LoadingConfig + Stop button.
+  /// Mirrors the [AiChatItem]s already pushed into the controller, keyed by id,
+  /// so each new state reconciles items instead of rebuilding the transcript.
+  final Map<String, ChatMessage> _byId = {};
+
+  /// The last-rendered [AiToolItem] per id, so a status/output change re-renders
+  /// the tool card (the kit's [ChatMessage] equality ignores `customBuilder`).
+  final Map<String, AiToolItem> _toolById = {};
+
+  /// Whether a turn is in flight; drives the LoadingConfig + Stop button.
   bool _isLoading = false;
-
-  /// `customProperties['id']` of the in-flight AI bubble (null when idle).
-  String? _streamingId;
-
-  /// The current AI placeholder message, updated in place as text streams in.
-  ChatMessage? _aiMessage;
 
   @override
   void dispose() {
@@ -47,97 +55,157 @@ class _AiDayPanelState extends State<AiDayPanel> {
     super.dispose();
   }
 
-  /// Builds a user bubble, an empty streaming AI bubble, and kicks off the cubit.
+  /// Hands the instruction to the cubit. The transcript (including the user
+  /// bubble) is rendered from the emitted state in [_sync] — we do not touch
+  /// the controller here.
   void _onSend(ChatMessage userMessage) {
     final instruction = userMessage.text.trim();
     if (instruction.isEmpty || _isLoading) return;
 
-    // The widget does NOT auto-add the user's message — we add it ourselves so
-    // the prompt is captured in the transcript (the cubit never stores it).
-    _chatController.addMessage(userMessage);
-
-    final emailContext = widget.contextProvider?.call();
-
-    _streamingId = 'ai_${DateTime.now().millisecondsSinceEpoch}';
-    _aiMessage = ChatMessage(
-      text: '',
-      user: _ai,
-      createdAt: DateTime.now(),
-      isMarkdown: true,
-      customProperties: {'id': _streamingId},
-    );
-    _chatController.addStreamingMessage(_aiMessage!);
-
-    setState(() => _isLoading = true);
-    context.read<AiFolderCubit>().generate(instruction, context: emailContext);
+    context.read<AiFolderCubit>().send(
+          instruction,
+          currentFolderId: widget.folderIdProvider?.call(),
+          fallbackEmailsContext: widget.contextProvider?.call(),
+        );
   }
 
-  /// Cancels an in-flight generation, finalizing the partial AI bubble.
+  /// Cancels an in-flight turn; the cubit settles the partial bubble and emits
+  /// a non-streaming state, which [_sync] reflects.
   void _onCancelGenerating() {
-    context.read<AiFolderCubit>().cancel(); // emits Idle (listener no-ops)
-    _finalizeStream();
-  }
-
-  /// Clears the transcript and resets all generation state.
-  void _clear() {
     context.read<AiFolderCubit>().cancel();
-    _chatController.clearMessages();
-    _streamingId = null;
-    _aiMessage = null;
-    if (_isLoading) setState(() => _isLoading = false);
   }
 
-  /// Stops the streaming animation for the in-flight bubble and clears state.
-  void _finalizeStream() {
-    final id = _streamingId;
-    if (id != null) _chatController.stopStreamingMessage(id);
-    _streamingId = null;
-    _aiMessage = null;
-    if (_isLoading) setState(() => _isLoading = false);
+  /// Clears the conversation and starts a fresh chat.
+  void _newChat() {
+    context.read<AiFolderCubit>().reset();
   }
 
-  /// Translates each sealed [AiComposeState] into controller calls. The kit
-  /// owns rendering, so there is no `builder` — only this listener mutates the
+  /// Reconciles the chat controller with the emitted [AiFolderChatState]: the
+  /// kit owns rendering, so this listener is the only place that mutates the
   /// transcript.
-  void _onState(BuildContext context, AiComposeState state) {
-    switch (state) {
-      case AiComposeIdle():
-        // Produced only by cancel(); Stop/Clear handle their own UI
-        // imperatively. No-op here to avoid wiping the transcript on cancel.
-        break;
+  void _sync(BuildContext context, AiFolderChatState state) {
+    // New Chat / empty transcript.
+    if (state.messages.isEmpty) {
+      if (_byId.isNotEmpty) {
+        _chatController.clearMessages();
+        _byId.clear();
+        _toolById.clear();
+      }
+      _setLoading(state.isStreaming);
+      return;
+    }
 
-      case AiComposeStreaming(:final text):
-        final msg = _aiMessage;
-        if (msg != null) {
-          // `text` is already the FULL accumulated string (the cubit owns the
-          // StringBuffer), so pass it straight through. copyWith preserves
-          // customProperties['id'], which updateMessage matches on.
-          _aiMessage = msg.copyWith(text: text);
-          _chatController.updateMessage(_aiMessage!);
+    // Add new items and update changed ones (a streaming assistant bubble whose
+    // text grew, or a tool card transitioning running → complete/error).
+    for (final item in state.messages) {
+      switch (item) {
+        case AiToolItem():
+          _syncToolItem(item);
+        case AiTextMessage():
+          _syncTextMessage(item);
+      }
+    }
+
+    // Stop the streaming animation on assistant bubbles once the turn settles.
+    if (!state.isStreaming) {
+      for (final m in state.messages) {
+        if (m is AiTextMessage && !m.isUser) {
+          _chatController.stopStreamingMessage(m.id);
         }
+      }
+    }
 
-      case AiComposeDone(:final text):
-        final msg = _aiMessage;
-        if (msg != null) {
-          _aiMessage = msg.copyWith(text: text);
-          _chatController.updateMessage(_aiMessage!);
-        }
-        _finalizeStream();
-
-      case AiComposeError(:final failure):
-        final msg = _aiMessage;
-        if (msg != null) {
-          _aiMessage = msg.copyWith(text: '⚠️ ${failure.message}');
-          _chatController.updateMessage(_aiMessage!);
-        } else {
-          _chatController.addMessage(ChatMessage(
-            text: '⚠️ ${failure.message}',
+    // Surface a hard failure: append it to the trailing assistant bubble if one
+    // exists for this turn, else add a dedicated error bubble.
+    if (state.failure != null) {
+      final errText = '⚠️ ${state.failure!.message}';
+      AiTextMessage? lastAssistant;
+      for (final m in state.messages) {
+        if (m is AiTextMessage && !m.isUser) lastAssistant = m;
+      }
+      if (lastAssistant != null && _byId[lastAssistant.id] != null) {
+        final existing = _byId[lastAssistant.id]!;
+        final merged = existing.text.isEmpty
+            ? errText
+            : '${existing.text}\n\n$errText';
+        final updated = existing.copyWith(text: merged);
+        _byId[lastAssistant.id] = updated;
+        _chatController.updateMessage(updated);
+      } else {
+        // Turn-stable id: keyed off the last message in this turn so repeated
+        // re-emissions of the same failure dedupe via the containsKey guard,
+        // even when controller-only inserts have changed _byId.length.
+        final errId = 'err_${state.messages.last.id}';
+        if (!_byId.containsKey(errId)) {
+          final cm = ChatMessage(
+            text: errText,
             user: _ai,
             createdAt: DateTime.now(),
-          ));
+            customProperties: {'id': errId},
+          );
+          _byId[errId] = cm;
+          _chatController.addMessage(cm);
         }
-        _finalizeStream();
+      }
     }
+
+    _setLoading(state.isStreaming);
+  }
+
+  /// Reconciles a single text bubble into the controller.
+  void _syncTextMessage(AiTextMessage m) {
+    final existing = _byId[m.id];
+    if (existing == null) {
+      // Don't render an empty in-flight assistant bubble: the cubit may drop
+      // it (failure/cancel before any output). Add it on its first delta.
+      if (!m.isUser && m.text.isEmpty) return;
+      final cm = ChatMessage(
+        text: m.text,
+        user: m.isUser ? _user : _ai,
+        createdAt: DateTime.now(),
+        isMarkdown: !m.isUser,
+        customProperties: {'id': m.id},
+      );
+      _byId[m.id] = cm;
+      if (m.isUser) {
+        _chatController.addMessage(cm);
+      } else {
+        _chatController.addStreamingMessage(cm);
+      }
+    } else if (existing.text != m.text) {
+      final updated = existing.copyWith(text: m.text);
+      _byId[m.id] = updated;
+      _chatController.updateMessage(updated);
+    }
+  }
+
+  /// Reconciles a single inline tool card into the controller. The card is a
+  /// full-width custom-builder message (no bubble chrome); a status/output
+  /// change rebuilds its [ToolCallCard] in place.
+  void _syncToolItem(AiToolItem item) {
+    final prev = _toolById[item.id];
+    if (prev == item) return;
+    _toolById[item.id] = item;
+
+    final cm = (_byId[item.id] ??
+            ChatMessage(
+              text: '',
+              user: _ai,
+              createdAt: DateTime.now(),
+              customProperties: {'id': item.id},
+            ))
+        .copyWith(customBuilder: (context, _) => ToolCallCard(item: item));
+    _byId[item.id] = cm;
+
+    if (prev == null) {
+      _chatController.addMessage(cm);
+    } else {
+      _chatController.updateMessage(cm);
+    }
+  }
+
+  void _setLoading(bool loading) {
+    if (_isLoading != loading) setState(() => _isLoading = loading);
   }
 
   @override
@@ -147,11 +215,11 @@ class _AiDayPanelState extends State<AiDayPanel> {
       color: c.surfacePanel,
       child: Column(
         children: [
-          _Header(onClose: widget.onClose, onClear: _clear),
+          _Header(onClose: widget.onClose, onNewChat: _newChat),
           Divider(height: 1, color: c.separatorStrong),
           Expanded(
-            child: BlocListener<AiFolderCubit, AiComposeState>(
-              listener: _onState,
+            child: BlocListener<AiFolderCubit, AiFolderChatState>(
+              listener: _sync,
               child: _buildChat(c),
             ),
           ),
@@ -200,7 +268,7 @@ class _AiDayPanelState extends State<AiDayPanel> {
 
         welcomeMessageConfig: WelcomeMessageConfig(
           centerVertically: true,
-          title: 'Enter an instruction to draft with AI.',
+          title: 'Ask about this folder — I can read and search your mail.',
           titleStyle: TextStyle(
             color: c.textMuted,
             fontSize: 13,
@@ -236,7 +304,7 @@ class _AiDayPanelState extends State<AiDayPanel> {
           textStyle: TextStyle(color: c.textPrimary, fontSize: 13),
           sendButtonColor: AppColors.accent,
           decoration: InputDecoration(
-            hintText: 'Describe what to write…',
+            hintText: 'Ask about your mail…',
             hintStyle: TextStyle(color: c.textMuted, fontSize: 13),
             border: InputBorder.none,
             contentPadding:
@@ -255,10 +323,10 @@ class _AiDayPanelState extends State<AiDayPanel> {
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.onClose, required this.onClear});
+  const _Header({required this.onClose, required this.onNewChat});
 
   final VoidCallback onClose;
-  final VoidCallback onClear;
+  final VoidCallback onNewChat;
 
   @override
   Widget build(BuildContext context) {
@@ -283,11 +351,11 @@ class _Header extends StatelessWidget {
               ),
             ),
             IconButton(
-              icon: Icon(Icons.delete_sweep_outlined, size: 16, color: c.textMuted),
-              tooltip: 'Clear conversation',
+              icon: Icon(Icons.add_comment_outlined, size: 16, color: c.textMuted),
+              tooltip: 'New Chat',
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-              onPressed: onClear,
+              onPressed: onNewChat,
             ),
             IconButton(
               icon: Icon(Icons.close, size: 16, color: c.textMuted),

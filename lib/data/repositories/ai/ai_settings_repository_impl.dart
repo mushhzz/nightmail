@@ -29,6 +29,17 @@ class AiSettingsRepositoryImpl implements AiSettingsRepository {
   /// Secure-storage key for the "send mail bodies to cloud providers" guard.
   static const String _allowCloudKey = 'ai_allow_cloud_for_bodies';
 
+  /// Secure-storage keys for the configurable folder-agent caps.
+  static const String _agentMaxRoundsKey = 'ai_agent_max_rounds';
+  static const String _agentMaxToolCallsKey =
+      'ai_agent_max_tool_calls_per_round';
+
+  /// Cap defaults (equal to today's compile-time constants) and clamp range.
+  static const int _defaultMaxRounds = 5;
+  static const int _defaultMaxToolCalls = 8;
+  static const int _minCap = 1;
+  static const int _maxCap = 20;
+
   // --- Per-capability routing ---------------------------------------------
 
   @override
@@ -169,9 +180,48 @@ class AiSettingsRepositoryImpl implements AiSettingsRepository {
         return unit;
       });
 
+  // --- Folder-agent caps --------------------------------------------------
+
+  @override
+  Future<Either<Failure, int>> getAgentMaxRounds() => _guard(() async {
+        final raw = await _storage.read(key: _agentMaxRoundsKey);
+        return _clamp(int.tryParse(raw ?? '') ?? _defaultMaxRounds);
+      });
+
+  @override
+  Future<Either<Failure, Unit>> setAgentMaxRounds(int value) =>
+      _guard(() async {
+        await _storage.write(
+          key: _agentMaxRoundsKey,
+          value: _clamp(value).toString(),
+        );
+        return unit;
+      });
+
+  @override
+  Future<Either<Failure, int>> getAgentMaxToolCallsPerRound() =>
+      _guard(() async {
+        final raw = await _storage.read(key: _agentMaxToolCallsKey);
+        return _clamp(int.tryParse(raw ?? '') ?? _defaultMaxToolCalls);
+      });
+
+  @override
+  Future<Either<Failure, Unit>> setAgentMaxToolCallsPerRound(int value) =>
+      _guard(() async {
+        await _storage.write(
+          key: _agentMaxToolCallsKey,
+          value: _clamp(value).toString(),
+        );
+        return unit;
+      });
+
   // --- Helpers ------------------------------------------------------------
 
   String _apiKeyKey(String providerId) => '$_apiKeyPrefix$providerId';
+
+  /// Clamps a cap value into the supported [_minCap]–[_maxCap] range so a
+  /// stale or garbage stored value can never break the agent loop.
+  int _clamp(int v) => v < _minCap ? _minCap : (v > _maxCap ? _maxCap : v);
 
   /// Runs [body], normalizing any thrown error into a [CacheFailure].
   Future<Either<Failure, T>> _guard<T>(Future<T> Function() body) async {

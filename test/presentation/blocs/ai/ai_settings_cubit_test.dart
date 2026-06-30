@@ -38,6 +38,7 @@ void main() {
     provideDummy<Either<Failure, AiProvider>>(Right(provider('dummy')));
     provideDummy<Either<Failure, AiRouting?>>(const Right(null));
     provideDummy<Either<Failure, bool>>(const Right(false));
+    provideDummy<Either<Failure, int>>(const Right(0));
     provideDummy<Either<Failure, Unit>>(Right(unit));
 
     mockCatalog = MockAiCatalogRepository();
@@ -51,12 +52,16 @@ void main() {
   tearDown(() => cubit.close());
 
   /// Stubs a fully successful `load()`: a catalog, no routing, no configured
-  /// providers, and the cloud-bodies guard off — overridable per test.
+  /// providers, the cloud-bodies guard off, and the two folder-agent caps —
+  /// overridable per test. The cap defaults (5 / 7) differ so the test can
+  /// assert each flows into its own state field distinctly.
   void stubLoad({
     List<AiProvider> providers = const [],
     List<AiProvider> configured = const [],
     Map<AiCapability, AiRouting> routing = const {},
     bool allowCloudForBodies = false,
+    int agentMaxRounds = 5,
+    int agentMaxToolCallsPerRound = 7,
   }) {
     when(mockCatalog.getProviders(forceRefresh: anyNamed('forceRefresh')))
         .thenAnswer((_) async => Right(providers));
@@ -67,6 +72,10 @@ void main() {
             Right(routing[invocation.positionalArguments.first]));
     when(mockSettings.getAllowCloudForBodies())
         .thenAnswer((_) async => Right(allowCloudForBodies));
+    when(mockSettings.getAgentMaxRounds())
+        .thenAnswer((_) async => Right(agentMaxRounds));
+    when(mockSettings.getAgentMaxToolCallsPerRound())
+        .thenAnswer((_) async => Right(agentMaxToolCallsPerRound));
   }
 
   group('load', () {
@@ -81,6 +90,8 @@ void main() {
         configured: [provider('openai')],
         routing: routing,
         allowCloudForBodies: true,
+        agentMaxRounds: 9,
+        agentMaxToolCallsPerRound: 12,
       );
 
       final states = <AiSettingsState>[];
@@ -98,7 +109,22 @@ void main() {
       expect(loaded.configured, [provider('openai')]);
       expect(loaded.routing, routing);
       expect(loaded.allowCloudForBodies, isTrue);
+      // Each cap flows into its own field distinctly.
+      expect(loaded.agentMaxRounds, 9);
+      expect(loaded.agentMaxToolCallsPerRound, 12);
       expect(loaded.errorMessage, isNull);
+    });
+
+    test('flows the two folder-agent caps into state distinctly', () async {
+      // stubLoad's defaults differ (5 rounds / 7 tool calls) so a swapped read
+      // would be caught.
+      stubLoad();
+
+      await cubit.load();
+
+      expect(cubit.state.status, AiSettingsStatus.loaded);
+      expect(cubit.state.agentMaxRounds, 5);
+      expect(cubit.state.agentMaxToolCallsPerRound, 7);
     });
 
     test('defaults allowCloudForBodies to false when the guard read fails',
@@ -111,6 +137,21 @@ void main() {
 
       expect(cubit.state.status, AiSettingsStatus.loaded);
       expect(cubit.state.allowCloudForBodies, isFalse);
+    });
+
+    test('defaults the folder-agent caps to 5 / 8 when their reads fail',
+        () async {
+      stubLoad();
+      when(mockSettings.getAgentMaxRounds()).thenAnswer(
+          (_) async => const Left(CacheFailure(message: 'no row')));
+      when(mockSettings.getAgentMaxToolCallsPerRound()).thenAnswer(
+          (_) async => const Left(CacheFailure(message: 'no row')));
+
+      await cubit.load();
+
+      expect(cubit.state.status, AiSettingsStatus.loaded);
+      expect(cubit.state.agentMaxRounds, 5);
+      expect(cubit.state.agentMaxToolCallsPerRound, 8);
     });
 
     test('emits error when the provider catalog cannot be loaded', () async {
@@ -242,6 +283,102 @@ void main() {
 
       expect(cubit.state.status, AiSettingsStatus.error);
       expect(cubit.state.allowCloudForBodies, isFalse);
+    });
+  });
+
+  group('setAgentMaxRounds', () {
+    test('persists and emits the new value', () async {
+      when(mockSettings.setAgentMaxRounds(any))
+          .thenAnswer((_) async => Right(unit));
+
+      final states = <AiSettingsState>[];
+      final sub = cubit.stream.listen(states.add);
+
+      await cubit.setAgentMaxRounds(12);
+      await pumpEventQueue();
+      await sub.cancel();
+
+      verify(mockSettings.setAgentMaxRounds(12));
+      expect(states.last.agentMaxRounds, 12);
+    });
+
+    test('emits error and keeps the prior value on failure', () async {
+      // Seed a known value via a successful load (stubLoad default is 5).
+      stubLoad();
+      await cubit.load();
+      expect(cubit.state.agentMaxRounds, 5);
+
+      when(mockSettings.setAgentMaxRounds(any)).thenAnswer(
+          (_) async => const Left(CacheFailure(message: 'write failed')));
+
+      await cubit.setAgentMaxRounds(12);
+
+      expect(cubit.state.status, AiSettingsStatus.error);
+      expect(cubit.state.agentMaxRounds, 5);
+    });
+
+    test('clamps an out-of-range value to 1..20 before persist and emit',
+        () async {
+      when(mockSettings.setAgentMaxRounds(any))
+          .thenAnswer((_) async => Right(unit));
+
+      await cubit.setAgentMaxRounds(999);
+
+      verify(mockSettings.setAgentMaxRounds(20));
+      expect(cubit.state.agentMaxRounds, 20);
+
+      await cubit.setAgentMaxRounds(0);
+
+      verify(mockSettings.setAgentMaxRounds(1));
+      expect(cubit.state.agentMaxRounds, 1);
+    });
+  });
+
+  group('setAgentMaxToolCallsPerRound', () {
+    test('persists and emits the new value', () async {
+      when(mockSettings.setAgentMaxToolCallsPerRound(any))
+          .thenAnswer((_) async => Right(unit));
+
+      final states = <AiSettingsState>[];
+      final sub = cubit.stream.listen(states.add);
+
+      await cubit.setAgentMaxToolCallsPerRound(15);
+      await pumpEventQueue();
+      await sub.cancel();
+
+      verify(mockSettings.setAgentMaxToolCallsPerRound(15));
+      expect(states.last.agentMaxToolCallsPerRound, 15);
+    });
+
+    test('emits error and keeps the prior value on failure', () async {
+      // Seed a known value via a successful load (stubLoad default is 7).
+      stubLoad();
+      await cubit.load();
+      expect(cubit.state.agentMaxToolCallsPerRound, 7);
+
+      when(mockSettings.setAgentMaxToolCallsPerRound(any)).thenAnswer(
+          (_) async => const Left(CacheFailure(message: 'write failed')));
+
+      await cubit.setAgentMaxToolCallsPerRound(15);
+
+      expect(cubit.state.status, AiSettingsStatus.error);
+      expect(cubit.state.agentMaxToolCallsPerRound, 7);
+    });
+
+    test('clamps an out-of-range value to 1..20 before persist and emit',
+        () async {
+      when(mockSettings.setAgentMaxToolCallsPerRound(any))
+          .thenAnswer((_) async => Right(unit));
+
+      await cubit.setAgentMaxToolCallsPerRound(999);
+
+      verify(mockSettings.setAgentMaxToolCallsPerRound(20));
+      expect(cubit.state.agentMaxToolCallsPerRound, 20);
+
+      await cubit.setAgentMaxToolCallsPerRound(0);
+
+      verify(mockSettings.setAgentMaxToolCallsPerRound(1));
+      expect(cubit.state.agentMaxToolCallsPerRound, 1);
     });
   });
 }

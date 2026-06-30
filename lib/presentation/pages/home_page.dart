@@ -555,6 +555,13 @@ class _ThreePanelLayoutState extends State<_ThreePanelLayout> {
                     width: calendarWidth,
                     child: AiDayPanel(
                       onClose: () => context.read<HomeCubit>().showEmail(),
+                      folderIdProvider: () {
+                        final listState =
+                            context.read<EmailListBloc>().state;
+                        return listState is EmailListLoaded
+                            ? listState.currentFolderId
+                            : null;
+                      },
                       contextProvider: () {
                         final listState =
                             context.read<EmailListBloc>().state;

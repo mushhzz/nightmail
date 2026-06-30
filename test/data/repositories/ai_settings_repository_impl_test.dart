@@ -21,6 +21,8 @@ void main() {
   // assert against the exact secure-storage keys the impl reads/writes.
   const apiKeyPrefix = 'ai_apikey_';
   const allowCloudKey = 'ai_allow_cloud_for_bodies';
+  const agentMaxRoundsKey = 'ai_agent_max_rounds';
+  const agentMaxToolCallsKey = 'ai_agent_max_tool_calls_per_round';
 
   setUp(() {
     mockConfig = MockAiConfigDatasource();
@@ -106,6 +108,218 @@ void main() {
 
       expect(written, 'true');
       expect(readBack, const Right<Failure, bool>(true));
+    });
+  });
+
+  group('getAgentMaxRounds', () {
+    test('returns Right(5) when the key is absent (default)', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => null);
+
+      final result = await repository.getAgentMaxRounds();
+
+      expect(result, const Right<Failure, int>(5));
+      verify(mockStorage.read(key: agentMaxRoundsKey));
+    });
+
+    test('returns Right(5) when the stored value is non-numeric', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => 'not-a-number');
+
+      final result = await repository.getAgentMaxRounds();
+
+      expect(result, const Right<Failure, int>(5));
+    });
+
+    test('returns the stored value when within range', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '7');
+
+      final result = await repository.getAgentMaxRounds();
+
+      expect(result, const Right<Failure, int>(7));
+    });
+
+    test('clamps a stored value below the minimum up to 1', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '0');
+
+      final result = await repository.getAgentMaxRounds();
+
+      expect(result, const Right<Failure, int>(1));
+    });
+
+    test('clamps a stored value above the maximum down to 20', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '999');
+
+      final result = await repository.getAgentMaxRounds();
+
+      expect(result, const Right<Failure, int>(20));
+    });
+  });
+
+  group('setAgentMaxRounds', () {
+    test('persists the stringified value under the cap key', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxRounds(7);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxRoundsKey, value: '7'));
+    });
+
+    test('clamps a below-range value up to 1 before writing', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxRounds(0);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxRoundsKey, value: '1'));
+    });
+
+    test('clamps an above-range value down to 20 before writing', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxRounds(999);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxRoundsKey, value: '20'));
+    });
+
+    test('round-trips through storage: a written value reads back clamped',
+        () async {
+      // Capture what setAgentMaxRounds writes, then feed it back into read to
+      // prove the stringify/parse-and-clamp pair are inverses.
+      String? written;
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((invocation) async {
+        written = invocation.namedArguments[const Symbol('value')] as String?;
+      });
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => written);
+
+      await repository.setAgentMaxRounds(12);
+      final readBack = await repository.getAgentMaxRounds();
+
+      expect(written, '12');
+      expect(readBack, const Right<Failure, int>(12));
+    });
+  });
+
+  group('getAgentMaxToolCallsPerRound', () {
+    test('returns Right(8) when the key is absent (default)', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => null);
+
+      final result = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(result, const Right<Failure, int>(8));
+      verify(mockStorage.read(key: agentMaxToolCallsKey));
+    });
+
+    test('returns Right(8) when the stored value is non-numeric', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => 'garbage');
+
+      final result = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(result, const Right<Failure, int>(8));
+    });
+
+    test('returns the stored value when within range', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '3');
+
+      final result = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(result, const Right<Failure, int>(3));
+    });
+
+    test('clamps a stored value below the minimum up to 1', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '0');
+
+      final result = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(result, const Right<Failure, int>(1));
+    });
+
+    test('clamps a stored value above the maximum down to 20', () async {
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => '999');
+
+      final result = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(result, const Right<Failure, int>(20));
+    });
+  });
+
+  group('setAgentMaxToolCallsPerRound', () {
+    test('persists the stringified value under the cap key', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxToolCallsPerRound(3);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxToolCallsKey, value: '3'));
+    });
+
+    test('clamps a below-range value up to 1 before writing', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxToolCallsPerRound(0);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxToolCallsKey, value: '1'));
+    });
+
+    test('clamps an above-range value down to 20 before writing', () async {
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((_) async {});
+
+      final result = await repository.setAgentMaxToolCallsPerRound(999);
+
+      expect(result, Right<Failure, Unit>(unit));
+      verify(mockStorage.write(key: agentMaxToolCallsKey, value: '20'));
+    });
+
+    test('round-trips through storage: a written value reads back clamped',
+        () async {
+      String? written;
+      when(mockStorage.write(
+        key: anyNamed('key'),
+        value: anyNamed('value'),
+      )).thenAnswer((invocation) async {
+        written = invocation.namedArguments[const Symbol('value')] as String?;
+      });
+      when(mockStorage.read(key: anyNamed('key')))
+          .thenAnswer((_) async => written);
+
+      await repository.setAgentMaxToolCallsPerRound(4);
+      final readBack = await repository.getAgentMaxToolCallsPerRound();
+
+      expect(written, '4');
+      expect(readBack, const Right<Failure, int>(4));
     });
   });
 

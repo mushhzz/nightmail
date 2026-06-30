@@ -13,6 +13,8 @@ import 'package:nightmail/domain/entities/ai/ai_message.dart';
 import 'package:nightmail/domain/entities/ai/ai_provider.dart';
 import 'package:nightmail/domain/entities/ai/ai_request.dart';
 import 'package:nightmail/domain/entities/ai/ai_response.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_call.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_definition.dart';
 
 import 'openai_compatible_adapter_test.mocks.dart';
 
@@ -700,6 +702,407 @@ void main() {
       expect(terminal.single.finishReason, 'completed');
       expect(terminal.single.promptTokens, 7);
       expect(terminal.single.completionTokens, 2);
+    });
+  });
+
+  // §7: OpenAI-compatible tool-calling wire work. Two angles — request encoding
+  // (tool defs + an assistant tool_calls turn + a tool-role result) and SSE
+  // parsing (streamed delta.tool_calls fragments → assembled AiToolCalls).
+  group('tool-calling request encoding', () {
+    const tListEmailsTool = AiToolDefinition(
+      name: 'list_emails',
+      description: 'List emails in a folder.',
+      parametersSchema: {
+        'type': 'object',
+        'properties': {
+          'folder_id': {'type': 'string'},
+          'unread_only': {'type': 'boolean'},
+        },
+      },
+    );
+
+    final tToolRequest = AiRequest(
+      providerId: 'openai',
+      modelId: 'gpt-4o-mini',
+      tools: const [tListEmailsTool],
+      messages: const [
+        AiMessage(role: AiRole.user, content: 'How many unread?'),
+        AiMessage(
+          role: AiRole.assistant,
+          // Empty content: the model only asked for a tool.
+          content: '',
+          toolCalls: [
+            AiToolCall(
+              id: 'call_abc',
+              name: 'list_emails',
+              arguments: {'folder_id': 'inbox', 'unread_only': true},
+            ),
+          ],
+        ),
+        AiMessage(
+          role: AiRole.tool,
+          content: '[{"id":"1","subject":"Hi"}]',
+          toolCallId: 'call_abc',
+          name: 'list_emails',
+        ),
+      ],
+    );
+
+    test(
+        'encodes tools, tool_choice, the assistant tool_calls and the '
+        'tool-role result', () async {
+      when(mockDio.post<Map<String, dynamic>>(
+        any,
+        data: anyNamed('data'),
+        options: anyNamed('options'),
+      )).thenAnswer(
+        (_) async => Response<Map<String, dynamic>>(
+          requestOptions: ro(),
+          statusCode: 200,
+          data: const <String, dynamic>{
+            'choices': [
+              {
+                'message': {'role': 'assistant', 'content': 'You have 1.'},
+                'finish_reason': 'stop',
+              },
+            ],
+          },
+        ),
+      );
+
+      await adapter.run(tToolRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(mockDio.post<Map<String, dynamic>>(
+        captureAny,
+        data: captureAnyNamed('data'),
+        options: anyNamed('options'),
+      )).captured;
+      final data = captured[1] as Map<String, dynamic>;
+
+      // tools: [{type:'function', function:{name, description, parameters}}]
+      final tools = data['tools'] as List;
+      expect(tools, hasLength(1));
+      final tool = tools.single as Map<String, dynamic>;
+      expect(tool['type'], 'function');
+      final fn = tool['function'] as Map<String, dynamic>;
+      expect(fn['name'], 'list_emails');
+      expect(fn['description'], 'List emails in a folder.');
+      expect(fn['parameters'], tListEmailsTool.parametersSchema);
+
+      // tool_choice is implicitly 'auto' whenever tools are present.
+      expect(data['tool_choice'], 'auto');
+
+      final messages = data['messages'] as List;
+      expect(messages, hasLength(3));
+
+      // The assistant turn carries tool_calls; content is null (was empty) and
+      // arguments are serialized as a JSON *string*, not a nested object.
+      final assistant = messages[1] as Map<String, dynamic>;
+      expect(assistant['role'], 'assistant');
+      expect(assistant['content'], isNull);
+      final calls = assistant['tool_calls'] as List;
+      expect(calls, hasLength(1));
+      final call = calls.single as Map<String, dynamic>;
+      expect(call['id'], 'call_abc');
+      expect(call['type'], 'function');
+      final callFn = call['function'] as Map<String, dynamic>;
+      expect(callFn['name'], 'list_emails');
+      expect(callFn['arguments'], isA<String>());
+      expect(
+        jsonDecode(callFn['arguments'] as String),
+        {'folder_id': 'inbox', 'unread_only': true},
+      );
+
+      // The tool-result turn: {role:'tool', tool_call_id, content}.
+      final toolMsg = messages[2] as Map<String, dynamic>;
+      expect(toolMsg['role'], 'tool');
+      expect(toolMsg['tool_call_id'], 'call_abc');
+      expect(toolMsg['content'], '[{"id":"1","subject":"Hi"}]');
+    });
+
+    // A request without tools must NOT advertise an empty tools array or pin a
+    // tool_choice — the keys are omitted entirely.
+    test('omits tools and tool_choice when no tools are supplied', () async {
+      when(mockDio.post<Map<String, dynamic>>(
+        any,
+        data: anyNamed('data'),
+        options: anyNamed('options'),
+      )).thenAnswer(
+        (_) async => Response<Map<String, dynamic>>(
+          requestOptions: ro(),
+          statusCode: 200,
+          data: const <String, dynamic>{
+            'choices': [
+              {
+                'message': {'role': 'assistant', 'content': 'ok'},
+                'finish_reason': 'stop',
+              },
+            ],
+          },
+        ),
+      );
+
+      await adapter.run(tRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(mockDio.post<Map<String, dynamic>>(
+        captureAny,
+        data: captureAnyNamed('data'),
+        options: anyNamed('options'),
+      )).captured;
+      final data = captured[1] as Map<String, dynamic>;
+
+      expect(data.containsKey('tools'), isFalse);
+      expect(data.containsKey('tool_choice'), isFalse);
+    });
+  });
+
+  group('tool-calling SSE parsing', () {
+    Uint8List sse(String s) => Uint8List.fromList(utf8.encode(s));
+
+    // jsonEncode keeps the embedded-string escaping honest so the adapter sees
+    // exactly the bytes a real provider would stream.
+    String dataLine(Object json) => 'data: ${jsonEncode(json)}\n\n';
+
+    Future<List<AiChunk>> runStream(List<Uint8List> events) async {
+      final responseBody = ResponseBody(
+        Stream<Uint8List>.fromIterable(events),
+        200,
+        headers: {
+          Headers.contentTypeHeader: ['text/event-stream'],
+        },
+      );
+      when(mockDio.post<ResponseBody>(
+        any,
+        data: anyNamed('data'),
+        options: anyNamed('options'),
+      )).thenAnswer(
+        (_) async => Response<ResponseBody>(
+          requestOptions: ro(),
+          statusCode: 200,
+          data: responseBody,
+        ),
+      );
+      final results = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+      return results
+          .map((e) => e.match((f) => fail('unexpected Left: $f'), (c) => c))
+          .toList();
+    }
+
+    test(
+        'assembles a single tool call from fragments split across chunks',
+        () async {
+      // id + function.name arrive on first sight; function.arguments streams as
+      // a sequence of string fragments the adapter must concatenate then decode.
+      final events = <Uint8List>[
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'call_abc',
+                    'type': 'function',
+                    'function': {'name': 'list_emails', 'arguments': ''},
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'function': {'arguments': '{"folder_id":'},
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'function': {'arguments': '"inbox","limit":5}'},
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        sse(dataLine({
+          'choices': [
+            {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+          ],
+        })),
+      ];
+
+      final chunks = await runStream(events);
+
+      final terminal = chunks.where((c) => c.done).toList();
+      expect(terminal, hasLength(1), reason: 'exactly one terminal chunk');
+      expect(terminal.single.finishReason, 'tool_calls');
+      expect(
+        terminal.single.toolCalls,
+        const [
+          AiToolCall(
+            id: 'call_abc',
+            name: 'list_emails',
+            arguments: {'folder_id': 'inbox', 'limit': 5},
+          ),
+        ],
+      );
+      // A pure tool-call round streams no visible text.
+      expect(chunks.where((c) => !c.done && c.delta.isNotEmpty), isEmpty);
+    });
+
+    test('assembles multiple parallel tool calls keyed by index, in order',
+        () async {
+      final events = <Uint8List>[
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'call_0',
+                    'function': {'name': 'list_folders', 'arguments': '{}'},
+                  },
+                  {
+                    'index': 1,
+                    'id': 'call_1',
+                    'function': {'name': 'search_emails', 'arguments': ''},
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        // The second call's arguments arrive in a later chunk.
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 1,
+                    'function': {'arguments': '{"query":"invoice"}'},
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        sse(dataLine({
+          'choices': [
+            {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+          ],
+        })),
+      ];
+
+      final chunks = await runStream(events);
+      final calls = chunks.firstWhere((c) => c.done).toolCalls;
+      expect(calls, isNotNull);
+      expect(calls, hasLength(2));
+      // Ordered by streamed index, each assembled independently.
+      expect(calls![0].id, 'call_0');
+      expect(calls[0].name, 'list_folders');
+      expect(calls[0].arguments, isEmpty);
+      expect(calls[1].id, 'call_1');
+      expect(calls[1].name, 'search_emails');
+      expect(calls[1].arguments, {'query': 'invoice'});
+    });
+
+    test(
+        'still emits accumulated tool calls when the stream closes without a '
+        'tool_calls finish_reason', () async {
+      // Some compatible servers omit the finish_reason and just close the byte
+      // stream; the !terminated fallback must still surface the tool call.
+      final events = <Uint8List>[
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'call_z',
+                    'function': {
+                      'name': 'get_email',
+                      'arguments': '{"id":"42"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        // No finish_reason, no [DONE] — the stream just ends.
+      ];
+
+      final chunks = await runStream(events);
+
+      final terminal = chunks.where((c) => c.done).toList();
+      expect(terminal, hasLength(1));
+      // The fallback terminal chunk re-labels the round as a tool-call round.
+      expect(terminal.single.finishReason, 'tool_calls');
+      expect(
+        terminal.single.toolCalls,
+        const [
+          AiToolCall(
+            id: 'call_z',
+            name: 'get_email',
+            arguments: {'id': '42'},
+          ),
+        ],
+      );
+    });
+
+    test('decodes unparseable arguments to an empty map (never throws)',
+        () async {
+      final events = <Uint8List>[
+        sse(dataLine({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'call_bad',
+                    'function': {
+                      'name': 'list_emails',
+                      'arguments': '{not json',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        })),
+        sse(dataLine({
+          'choices': [
+            {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+          ],
+        })),
+      ];
+
+      final chunks = await runStream(events);
+      final calls = chunks.firstWhere((c) => c.done).toolCalls;
+      expect(calls, hasLength(1));
+      expect(calls!.single.id, 'call_bad');
+      expect(calls.single.name, 'list_emails');
+      expect(calls.single.arguments, isEmpty);
     });
   });
 }

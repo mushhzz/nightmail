@@ -12,6 +12,8 @@ import 'package:nightmail/domain/entities/ai/ai_chunk.dart';
 import 'package:nightmail/domain/entities/ai/ai_message.dart';
 import 'package:nightmail/domain/entities/ai/ai_request.dart';
 import 'package:nightmail/domain/entities/ai/ai_response.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_call.dart';
+import 'package:nightmail/domain/entities/ai/ai_tool_definition.dart';
 
 import 'anthropic_adapter_test.mocks.dart';
 
@@ -554,6 +556,456 @@ void main() {
       expect(done.finishReason, 'max_tokens');
       expect(done.promptTokens, 5);
       expect(done.completionTokens, 3);
+    });
+  });
+
+  // §7 (Anthropic): request must advertise tools as
+  // `tools:[{name,description,input_schema}]`; an assistant turn that requested
+  // tools becomes a `tool_use` content block; an `AiRole.tool` result turn is
+  // carried as a `user` message holding a `tool_result` block keyed by
+  // `tool_use_id`.
+  group('tool support — request encoding', () {
+    const listEmailsSchema = <String, dynamic>{
+      'type': 'object',
+      'properties': {
+        'folder_id': {'type': 'string'},
+        'unread_only': {'type': 'boolean'},
+        'limit': {'type': 'integer'},
+      },
+    };
+
+    final toolDef = const AiToolDefinition(
+      name: 'list_emails',
+      description: 'List emails in a folder.',
+      parametersSchema: listEmailsSchema,
+    );
+
+    // A full agent round-trip in history: user asks, assistant requests a tool,
+    // the tool result comes back, and the model is asked to continue.
+    final agentRequest = AiRequest(
+      providerId: 'anthropic',
+      modelId: 'claude-3-5-sonnet',
+      maxTokens: 256,
+      messages: const [
+        AiMessage(role: AiRole.system, content: 'You are a mail agent.'),
+        AiMessage(role: AiRole.user, content: 'What is unread?'),
+        AiMessage(
+          role: AiRole.assistant,
+          content: '',
+          toolCalls: [
+            AiToolCall(
+              id: 'toolu_01',
+              name: 'list_emails',
+              arguments: {'unread_only': true, 'limit': 5},
+            ),
+          ],
+        ),
+        AiMessage(
+          role: AiRole.tool,
+          content: '1. From Alice — Invoice (unread)',
+          toolCallId: 'toolu_01',
+          name: 'list_emails',
+        ),
+      ],
+      tools: [toolDef],
+    );
+
+    // Stub a successful non-streaming response so `run` reaches the point of
+    // building and posting the wire body, which the tests then capture.
+    void stubOk() {
+      when(
+        mockDio.post<dynamic>(
+          any,
+          data: anyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).thenAnswer(
+        (_) async => Response<dynamic>(
+          data: const {
+            'content': [
+              {'type': 'text', 'text': 'ok'},
+            ],
+            'usage': {'input_tokens': 1, 'output_tokens': 1},
+          },
+          statusCode: 200,
+          requestOptions: RequestOptions(path: '/v1/messages'),
+        ),
+      );
+    }
+
+    test('advertises tools as [{name,description,input_schema}]', () async {
+      stubOk();
+
+      await adapter.run(agentRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      final body = captured[0] as Map<String, dynamic>;
+
+      final tools = (body['tools'] as List).cast<Map<String, dynamic>>();
+      expect(tools, hasLength(1));
+      expect(tools.single, {
+        'name': 'list_emails',
+        'description': 'List emails in a folder.',
+        'input_schema': listEmailsSchema,
+      });
+      // Anthropic uses `input_schema`, not OpenAI's `parameters`.
+      expect(tools.single.containsKey('parameters'), isFalse);
+    });
+
+    test('omits the tools field entirely when no tools are supplied', () async {
+      stubOk();
+
+      await adapter.run(tRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      final body = captured[0] as Map<String, dynamic>;
+
+      expect(body.containsKey('tools'), isFalse);
+    });
+
+    test('encodes an assistant tool-call turn as a tool_use content block',
+        () async {
+      stubOk();
+
+      await adapter.run(agentRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      final body = captured[0] as Map<String, dynamic>;
+      final messages = (body['messages'] as List).cast<Map<String, dynamic>>();
+
+      // The assistant turn carrying toolCalls is encoded as a content-block
+      // list with a single `tool_use` block (no leading text since content was
+      // empty), carrying the decoded arguments object verbatim.
+      final assistant = messages.firstWhere((m) => m['role'] == 'assistant');
+      expect(assistant['content'], [
+        {
+          'type': 'tool_use',
+          'id': 'toolu_01',
+          'name': 'list_emails',
+          'input': {'unread_only': true, 'limit': 5},
+        },
+      ]);
+    });
+
+    test('prepends a text block before tool_use when the assistant turn also '
+        'carries text', () async {
+      final request = agentRequest.copyWith(
+        messages: const [
+          AiMessage(role: AiRole.user, content: 'What is unread?'),
+          AiMessage(
+            role: AiRole.assistant,
+            content: 'Let me check your inbox.',
+            toolCalls: [
+              AiToolCall(
+                id: 'toolu_02',
+                name: 'list_emails',
+                arguments: {'unread_only': true},
+              ),
+            ],
+          ),
+        ],
+      );
+      stubOk();
+
+      await adapter.run(request, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      final body = captured[0] as Map<String, dynamic>;
+      final messages = (body['messages'] as List).cast<Map<String, dynamic>>();
+      final assistant = messages.firstWhere((m) => m['role'] == 'assistant');
+
+      expect(assistant['content'], [
+        {'type': 'text', 'text': 'Let me check your inbox.'},
+        {
+          'type': 'tool_use',
+          'id': 'toolu_02',
+          'name': 'list_emails',
+          'input': {'unread_only': true},
+        },
+      ]);
+    });
+
+    test('encodes a tool-role result as a user message with a tool_result '
+        'block keyed by tool_use_id', () async {
+      stubOk();
+
+      await adapter.run(agentRequest, apiKey: apiKey, baseUrl: baseUrl);
+
+      final captured = verify(
+        mockDio.post<dynamic>(
+          any,
+          data: captureAnyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).captured;
+      final body = captured[0] as Map<String, dynamic>;
+      final messages = (body['messages'] as List).cast<Map<String, dynamic>>();
+
+      // Anthropic has no `tool` role; the result rides inside a `user` message.
+      expect(
+        messages.any((m) => m['role'] == 'tool'),
+        isFalse,
+        reason: 'tool role must not appear in the Anthropic wire body',
+      );
+
+      // The tool result is the trailing user turn.
+      final toolResult = messages.last;
+      expect(toolResult['role'], 'user');
+      expect(toolResult['content'], [
+        {
+          'type': 'tool_result',
+          'tool_use_id': 'toolu_01',
+          'content': '1. From Alice — Invoice (unread)',
+        },
+      ]);
+    });
+  });
+
+  // §7 (Anthropic): a streamed `tool_use` block opens with
+  // `content_block_start` (id + name), accumulates `input_json_delta`
+  // fragments, closes with `content_block_stop`, and the round terminates with
+  // `message_delta` `stop_reason:'tool_use'`. The adapter must assemble the
+  // fragments into an `AiToolCall` with the *decoded* arguments and surface it
+  // on the terminal `AiChunk`.
+  group('tool support — SSE parsing', () {
+    Uint8List sse(String s) => Uint8List.fromList(utf8.encode(s));
+
+    void stubStream(List<Uint8List> events) {
+      final responseBody = ResponseBody(Stream.fromIterable(events), 200);
+      when(
+        mockDio.post<ResponseBody>(
+          any,
+          data: anyNamed('data'),
+          options: anyNamed('options'),
+        ),
+      ).thenAnswer(
+        (_) async => Response<ResponseBody>(
+          data: responseBody,
+          statusCode: 200,
+          requestOptions: RequestOptions(path: '/v1/messages'),
+        ),
+      );
+    }
+
+    test('assembles a streamed tool_use block into a decoded AiToolCall on the '
+        'terminal chunk', () async {
+      stubStream(<Uint8List>[
+        sse(
+          'event: message_start\n'
+          'data: {"type":"message_start",'
+          '"message":{"usage":{"input_tokens":20}}}\n\n',
+        ),
+        sse(
+          'event: content_block_start\n'
+          'data: {"type":"content_block_start","index":0,'
+          '"content_block":{"type":"tool_use","id":"toolu_42",'
+          '"name":"search_emails"}}\n\n',
+        ),
+        // The argument JSON arrives split across two fragments — the adapter
+        // must concatenate them before decoding.
+        sse(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":0,'
+          r'"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"inv"}}'
+          '\n\n',
+        ),
+        sse(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":0,'
+          r'"delta":{"type":"input_json_delta","partial_json":"oice\",\"limit\":3}"}}'
+          '\n\n',
+        ),
+        sse(
+          'event: content_block_stop\n'
+          'data: {"type":"content_block_stop","index":0}\n\n',
+        ),
+        sse(
+          'event: message_delta\n'
+          'data: {"type":"message_delta",'
+          '"delta":{"stop_reason":"tool_use"},'
+          '"usage":{"output_tokens":15}}\n\n',
+        ),
+        sse('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+      ]);
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      expect(chunks.every((c) => c.isRight()), isTrue);
+      final aiChunks = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .toList();
+
+      // A tool-only round emits no text deltas before the terminal chunk.
+      expect(aiChunks.takeWhile((c) => !c.done).map((c) => c.delta).join(), '');
+
+      // Exactly one terminal chunk, carrying the assembled tool call.
+      expect(aiChunks.where((c) => c.done).length, 1);
+      final done = aiChunks.last;
+      expect(done.done, isTrue);
+      expect(done.finishReason, 'tool_use');
+      expect(done.promptTokens, 20);
+      expect(done.completionTokens, 15);
+
+      expect(done.toolCalls, isNotNull);
+      expect(done.toolCalls, hasLength(1));
+      final call = done.toolCalls!.single;
+      expect(call.id, 'toolu_42');
+      expect(call.name, 'search_emails');
+      // Arguments are the *decoded* JSON object, not the raw fragment string.
+      expect(call.arguments, {'query': 'invoice', 'limit': 3});
+    });
+
+    test('emits empty arguments for a tool_use block with no input_json_delta '
+        'events', () async {
+      // A no-parameter tool (e.g. `list_folders`) streams a tool_use block with
+      // no `input_json_delta` events; arguments must decode to an empty map.
+      stubStream(<Uint8List>[
+        sse(
+          'event: content_block_start\n'
+          'data: {"type":"content_block_start","index":0,'
+          '"content_block":{"type":"tool_use","id":"toolu_07",'
+          '"name":"list_folders"}}\n\n',
+        ),
+        sse(
+          'event: content_block_stop\n'
+          'data: {"type":"content_block_stop","index":0}\n\n',
+        ),
+        sse(
+          'event: message_delta\n'
+          'data: {"type":"message_delta",'
+          '"delta":{"stop_reason":"tool_use"}}\n\n',
+        ),
+        sse('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+      ]);
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      final done = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .last;
+      expect(done.toolCalls, hasLength(1));
+      expect(done.toolCalls!.single.name, 'list_folders');
+      expect(done.toolCalls!.single.arguments, isEmpty);
+    });
+
+    test('interleaves a text block and a tool_use block, streaming text and '
+        'assembling the call in index order', () async {
+      // Text in block 0 streams through as deltas; the tool_use in block 1 is
+      // assembled onto the terminal chunk.
+      stubStream(<Uint8List>[
+        sse(
+          'event: content_block_start\n'
+          'data: {"type":"content_block_start","index":0,'
+          '"content_block":{"type":"text","text":""}}\n\n',
+        ),
+        sse(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":0,'
+          '"delta":{"type":"text_delta","text":"Checking now"}}\n\n',
+        ),
+        sse(
+          'event: content_block_stop\n'
+          'data: {"type":"content_block_stop","index":0}\n\n',
+        ),
+        sse(
+          'event: content_block_start\n'
+          'data: {"type":"content_block_start","index":1,'
+          '"content_block":{"type":"tool_use","id":"toolu_99",'
+          '"name":"get_email"}}\n\n',
+        ),
+        sse(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":1,'
+          r'"delta":{"type":"input_json_delta","partial_json":"{\"id\":\"e-1\"}"}}'
+          '\n\n',
+        ),
+        sse(
+          'event: content_block_stop\n'
+          'data: {"type":"content_block_stop","index":1}\n\n',
+        ),
+        sse(
+          'event: message_delta\n'
+          'data: {"type":"message_delta",'
+          '"delta":{"stop_reason":"tool_use"}}\n\n',
+        ),
+        sse('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+      ]);
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      final aiChunks = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .toList();
+
+      // The text block streamed through before the terminal chunk.
+      expect(
+        aiChunks.takeWhile((c) => !c.done).map((c) => c.delta).join(),
+        'Checking now',
+      );
+
+      final done = aiChunks.last;
+      expect(done.finishReason, 'tool_use');
+      expect(done.toolCalls, hasLength(1));
+      expect(done.toolCalls!.single.id, 'toolu_99');
+      expect(done.toolCalls!.single.name, 'get_email');
+      expect(done.toolCalls!.single.arguments, {'id': 'e-1'});
+    });
+
+    test('leaves toolCalls null on a plain text round (no tool_use blocks)',
+        () async {
+      stubStream(<Uint8List>[
+        sse(
+          'event: content_block_delta\n'
+          'data: {"type":"content_block_delta","index":0,'
+          '"delta":{"type":"text_delta","text":"Just text"}}\n\n',
+        ),
+        sse(
+          'event: message_delta\n'
+          'data: {"type":"message_delta",'
+          '"delta":{"stop_reason":"end_turn"}}\n\n',
+        ),
+        sse('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+      ]);
+
+      final chunks = await adapter
+          .stream(tRequest, apiKey: apiKey, baseUrl: baseUrl)
+          .toList();
+
+      final done = chunks
+          .map((c) => c.getOrElse((_) => throw StateError('left')))
+          .last;
+      expect(done.finishReason, 'end_turn');
+      expect(done.toolCalls, isNull);
     });
   });
 }
